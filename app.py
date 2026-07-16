@@ -1,360 +1,259 @@
-import streamlit as st
-import requests
-from bs4 import BeautifulSoup
-from PIL import Image
-import io
 import os
+import io
+import time
 import sqlite3
-from datetime import datetime, timedelta
-import hashlib
-import hmac
-import binascii
-import re
+import requests
+import threading
+from datetime import datetime
+import pdfplumber
+from bs4 import BeautifulSoup
+from flask import Flask
 
 # ============================================================
-# 1) CONFIGURAÇÃO DA PÁGINA
+# 1) MINI SERVIDOR PARA O RENDER NÃO DESLIGAR (HEALTH CHECK)
 # ============================================================
-st.set_page_config(page_title="Painel Destaque Toledo", layout="wide", page_icon="📝")
+app = Flask('MonitorToledo')
+
+@app.route('/')
+def home():
+    return "Monitores GM e Bombeiros Ativos e Vigiando!"
 
 # ============================================================
-# 2) ESTILIZAÇÃO CSS PROFISSIONAL (OTIMIZADA PARA ROLAGEM)
+# 2) CONFIGURAÇÕES GERAIS E PARAMETROS
 # ============================================================
-st.markdown(
-    """
-    <style>
-    /* Forçar rolagem em todos os dispositivos */
-    html, body, [data-testid="stAppViewContainer"] {
-        overflow-y: auto !important;
-    }
-    
-    /* Tornar a barra de rolagem bem visível */
-    ::-webkit-scrollbar {
-        width: 14px; /* Barra mais larga para fácil clique */
-        height: 14px;
-    }
-    ::-webkit-scrollbar-track {
-        background: #f1f1f1;
-        border-radius: 10px;
-    }
-    ::-webkit-scrollbar-thumb {
-        background: #004a99; /* Cor principal do portal */
-        border-radius: 10px;
-        border: 2px solid #f1f1f1;
-    }
-    ::-webkit-scrollbar-thumb:hover {
-        background: #003366;
-    }
+# Credenciais unificadas (conforme seus scripts)
+TELEGRAM_BOT_TOKEN = "7627971029:AAHRlLMFyP9f9gxr2dP40AiUfWLip85XDpA"
+TELEGRAM_CHAT_ID = "1982853012"
 
-    .stApp { background-color: #f8f9fa; }
-    .topo-titulo {
-        text-align: center; padding: 30px;
-        background: linear-gradient(90deg, #004a99 0%, #007bff 100%);
-        color: white; border-radius: 15px; margin-bottom: 25px;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-    }
-    .card-pauta {
-        background-color: white; padding: 20px; border-radius: 12px;
-        border-left: 6px solid #004a99; margin-bottom: 15px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-    }
-    .card-urgente { border-left: 6px solid #dc3545; background-color: #fff5f5; }
-    .card-programar { border-left: 6px solid #ffc107; background-color: #fffdf5; }
-    .tag-status {
-        padding: 4px 12px; border-radius: 20px; font-size: 0.75rem;
-        font-weight: bold; text-transform: uppercase;
-    }
-    .tag-urgente { background-color: #dc3545; color: white; }
-    .tag-normal { background-color: #e9ecef; color: #495057; }
-    .tag-programar { background-color: #ffc107; color: #000; }
-    .obs-box {
-        background-color: #e7f1ff; padding: 12px; border-radius: 8px;
-        border: 1px dashed #004a99; margin-top: 10px; margin-bottom: 15px; font-style: italic;
-    }
-    .boas-vindas {
-        font-size: 1.5rem; font-weight: bold; color: #004a99; margin-bottom: 10px;
-    }
-    .descricao-aba {
-        color: #666; font-size: 0.95rem; margin-bottom: 20px; line-height: 1.4;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# Caminhos de dados
+ARQUIVO_ID_GM = "ultimo_id.txt"
+SQLITE_PATH_BM = "/opt/render/project/src/sysbm_toledo.db"
+
+# Endpoints de busca
+URL_BASE_GM = "https://gmtoledo.cconet.com.br/impressao/completo?id="
+URL_TOLEDO_BM = "https://toledonews.com.br/bombeiros/bombeiros_lista.php"
+
+# Intervalos de varredura (em segundos)
+INTERVALO_BM = 45
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 # ============================================================
-# 3) CONFIG / CONSTANTES
+# 3) FUNÇÕES DE SUPORTE - GUARDA MUNICIPAL (GM)
 # ============================================================
-DB_PATH = os.getenv("DT_DB_PATH", "agenda_destaque.db")
-REQUEST_TIMEOUT = int(os.getenv("DT_REQUEST_TIMEOUT", "12"))
+def salvar_ultimo_id_gm(id_bo):
+    with open(ARQUIVO_ID_GM, "w") as f:
+        f.write(str(id_bo))
 
-# ============================================================
-# 4) SEGURANÇA: SENHAS (SEM HARDCODE)
-# ============================================================
-def verify_password(password: str, stored: str) -> bool:
+def ler_ultimo_id_gm():
+    if os.path.exists(ARQUIVO_ID_GM):
+        with open(ARQUIVO_ID_GM, "r") as f:
+            try:
+                return int(f.read().strip())
+            except:
+                return None
+    return None
+
+def buscar_valor_pdf(texto, inicio, fins):
+    if inicio not in texto: 
+        return "Não informado"
+    parte = texto.split(inicio)[1]
+    for fim in fins:
+        if fim in parte:
+            parte = parte.split(fim)[0]
+    return parte.replace(":", "").strip()
+
+def enviar_telegram_gm(id_bo, conteudo_pdf):
     try:
-        algo, it_str, salt_hex, hash_hex = stored.split("$", 3)
-        if algo != "pbkdf2_sha256":
-            return False
-        iterations = int(it_str)
-        salt = binascii.unhexlify(salt_hex.encode("ascii"))
-        expected = binascii.unhexlify(hash_hex.encode("ascii"))
-        test = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-        return hmac.compare_digest(test, expected)
-    except Exception:
+        with pdfplumber.open(io.BytesIO(conteudo_pdf)) as pdf:
+            texto = pdf.pages[0].extract_text()
+    except Exception as e:
+        log(f"Erro ao extrair PDF do BO {id_bo}: {e}")
         return False
 
-def load_auth_hashes():
-    auth = {}
-    try:
-        if "AUTH" in st.secrets:
-            auth = dict(st.secrets["AUTH"])
-    except Exception:
-        auth = {}
-
-    juan_hash = auth.get("juan") or os.getenv("DT_AUTH_JUAN", "").strip()
-    brayan_hash = auth.get("brayan") or os.getenv("DT_AUTH_BRAYAN", "").strip()
-
-    return {"juan": juan_hash, "brayan": brayan_hash}
-
-AUTH_HASHES = load_auth_hashes()
-AUTH_CONFIG_OK = bool(AUTH_HASHES.get("juan")) and bool(AUTH_HASHES.get("brayan"))
-
-# ============================================================
-# 5) BANCO DE DADOS (CONFIGURADO PARA PERSISTÊNCIA TOTAL)
-# ============================================================
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=FULL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
-    return conn
-
-def init_db():
-    conn = get_conn()
-    try:
-        c = conn.cursor()
-        # Tabela unificada das pautas de trabalho do Brayan
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pautas_trabalho (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                titulo TEXT,
-                link_ref TEXT,
-                status TEXT,
-                data_envio TEXT,
-                prioridade TEXT,
-                observacao TEXT
-            )
-            """
-        )
-        conn.commit()
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-    except Exception as e:
-        print(f"Erro ao inicializar banco: {e}")
-    finally:
-        conn.close()
-
-init_db()
-
-# ============================================================
-# 9) LOGIN (VERSÃO OTIMIZADA)
-# ============================================================
-if "autenticado" not in st.session_state:
-    st.session_state.autenticado = False
-
-if not st.session_state.autenticado:
-    st.markdown(
-        """
-        <div style="text-align: center; padding: 20px;">
-            <h1 style="color: #004a99; margin-bottom: 0; font-family: sans-serif;">DESTAQUE TOLEDO</h1>
-            <p style="color: #666; font-size: 1.1rem;">Painel de Controle Administrativo</p>
-        </div>
-        """, 
-        unsafe_allow_html=True
-    )
-
-    _, col2, _ = st.columns([1, 1.2, 1])
+    # Travas de segurança para evitar vazamento de dados pessoais
+    travas = ["Solicitante", "Telefone", "Dados", "Apoio", "Próprio", "Bairro", "Endereço", "Cidade"]
     
-    with col2:
-        with st.form("painel_login"):
-            st.markdown("<h3 style='text-align: center; margin-top: 0;'>Acesso Restrito</h3>", unsafe_allow_html=True)
-            
-            if not AUTH_CONFIG_OK:
-                st.error(
-                    "⚠️ **Configuração Faltando**\n\n"
-                    "As chaves de autenticação não foram detectadas.\n"
-                    "Certifique-se de configurar os secrets no Streamlit Cloud."
-                )
-                st.stop()
+    data_bruta = buscar_valor_pdf(texto, "Data/Hora Inicial:", ["Data/Hora Final", "Origem"])
+    data_hora = data_bruta.replace("\n", " ").strip()
+    
+    bairro = buscar_valor_pdf(texto, "Bairro:", travas)
+    rua = buscar_valor_pdf(texto, "Endereço:", travas + ["Nº"])
+    num = buscar_valor_pdf(texto, "Nº:", ["Compl", "Cidade", "Solicitante"])
+    cidade = buscar_valor_pdf(texto, "Cidade:", ["Transversal", "Solicitante"])
+    descricao = buscar_valor_pdf(texto, "Descrição:", ["Endereço", "Bairro", "Solicitante", "Dados"])
 
-            u = st.text_input("👤 Usuário", placeholder="Digite seu usuário").lower().strip()
-            s = st.text_input("🔑 Senha", type="password", placeholder="Digite sua senha")
-            
-            manter_conectado = st.checkbox("Manter-se conectado", value=True)
-            st.write("") 
-            
-            entrar = st.form_submit_button("ENTRAR NO SISTEMA", use_container_width=True, type="primary")
-            
-            if entrar:
-                if u in ("juan", "brayan") and verify_password(s, AUTH_HASHES.get(u, "")):
-                    st.session_state.autenticado = True
-                    st.session_state.perfil = u
-                    st.session_state["login_em"] = datetime.utcnow().timestamp()
-                    st.toast(f"Bem-vindo, {u.capitalize()}!", icon="✅")
-                    st.rerun()
-                else:
-                    st.error("❌ Usuário ou senha incorretos.")
-
-        st.markdown(
-            """
-            <div style="text-align: center; margin-top: 20px;">
-                <a href="https://www.destaquetoledo.com.br" target="_blank" style="text-decoration: none; color: #007bff; font-size: 0.85rem;">🌐 Acessar Site Público</a>
-                <br><br>
-                <small style="color: #999;">Suporte técnico: <a href="mailto:admin@destaquetoledo.com.br" style="color: #999;">Contato</a></small>
-            </div>
-            """, 
-            unsafe_allow_html=True
-        )
-
-else:
-    # ============================================================
-    # 10) INTERFACE INTERNA - DASHBOARD DIRETA (SEM ABAS)
-    # ============================================================
+    msg = (
+        f"━━━━━━━  <b>OCORRÊNCIA GM</b>  ━━━━━━━\n\n"
+        f"📅 <b>DATA/HORA:</b> {data_hora}\n"
+        f"🏘️ <b>BAIRRO:</b> {bairro}\n"
+        f"🏠 <b>ENDEREÇO:</b> {rua}, {num}\n"
+        f"🏙️ <b>CIDADE:</b> {cidade}\n\n"
+        f"📝 <b>DESCRIÇÃO:</b>\n<i>{descricao}</i>"
+    )
+    
+    endereco_completo = f"{rua}, {num} - {bairro}, {cidade} - PR"
+    maps_url = f"https://www.google.com/maps/search/?api=1&query={endereco_completo.replace(' ', '+')}"
+    
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg,
+        "parse_mode": "HTML",
+        "reply_markup": {
+            "inline_keyboard": [[
+                {"text": "📍 VER NO MAPA", "url": maps_url},
+                {"text": "📄 BO COMPLETO", "url": f"{URL_BASE_GM}{id_bo}"}
+            ]]
+        }
+    }
+    
     try:
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=30000, key="refresh_dashboard")
-    except:
-        pass
+        res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload, timeout=15)
+        return res.status_code == 200
+    except Exception as e:
+        log(f"Erro ao enviar Telegram GM: {e}")
+        return False
 
-    st.markdown('<div class="topo-titulo"><h1>DESTAQUE TOLEDO</h1></div>', unsafe_allow_html=True)
+# ============================================================
+# 4) FUNÇÕES DE SUPORTE - BOMBEIROS (BM)
+# ============================================================
+def enviar_telegram_bm(message, endereco):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        maps_url = f"https://www.google.com/maps/search/?api=1&query={endereco.replace(' ', '+')}+Toledo+PR"
+        
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown",  
+            "reply_markup": {
+                "inline_keyboard": [[{"text": "📍 VER LOCALIZAÇÃO NO MAPA", "url": maps_url}]]
+            }
+        }
+        requests.post(url, json=data, timeout=15)
+    except Exception as e:
+        log(f"Erro ao enviar Telegram Bombeiros: {e}")
 
-    # Identificação do usuário logado
-    st.markdown(f'<div class="boas-vindas">Bem-vindo, {st.session_state.perfil.capitalize()}!</div>', unsafe_allow_html=True)
-    st.markdown('<p class="descricao-aba">Envie, monitore e gerencie as matérias e publicações enviadas na Fila de Trabalho em tempo real.</p>', unsafe_allow_html=True)
+def coletar_ocorrencias_bombeiros():
+    lista_final = []
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        resp = requests.get(URL_TOLEDO_BM, headers=headers, timeout=20)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        tabela = soup.find("table", {"class": "scGridTabela"})
+        if not tabela: 
+            return lista_final
 
-    # Divisão em duas colunas: Esquerda para envio, Direita para o monitoramento
-    col_envio, col_monitor = st.columns([1.1, 1.2])
+        linhas = tabela.find_all("tr", class_=["scGridFieldOdd", "scGridFieldEven"])
+        for linha in linhas:
+            cols = linha.find_all("td")
+            if len(cols) >= 7:
+                if "TOLEDO" in cols[4].text.strip().upper():
+                    lista_final.append({
+                        "id": cols[1].text.strip(),
+                        "data": cols[3].text.strip().replace('\n', ' '),
+                        "natureza": cols[6].text.strip(),
+                        "endereco": cols[5].text.strip()
+                    })
+    except Exception as e:
+        log(f"Erro na varredura do site dos Bombeiros: {e}")
+    return lista_final
 
-    with col_envio:
-        st.subheader("🚀 Enviar Nova Pauta")
-        with st.form("form_envio_pauta", clear_on_submit=True):
-            col_f1, col_f2 = st.columns([3, 1])
-            with col_f1:
-                f_titulo = st.text_input("📌 Título da Matéria")
-            with col_f2:
-                f_urgencia = st.selectbox("Prioridade", ["Normal", "Programar", "URGENTE"])
-            
-            f_link = st.text_input("🔗 Link da Matéria (se houver)")
-            f_obs = st.text_area("📄 Texto da Matéria / Release", height=230, placeholder="Cole aqui o conteúdo da notícia ou release...")
+# ============================================================
+# 5) THREADS DE MONITORAMENTO EM SEGUNDO PLANO
+# ============================================================
+def loop_monitoramento_gm():
+    proximo_bo = ler_ultimo_id_gm()
+    if proximo_bo is None:
+        id_env = os.environ.get("START_ID")
+        proximo_bo = int(id_env) if id_env else 62586
+        salvar_ultimo_id_gm(proximo_bo)
 
-            if st.form_submit_button("🚀 ENVIAR PARA A FILA", use_container_width=True, type="primary"):
-                if f_titulo:
-                    hora_br = (datetime.utcnow() - timedelta(hours=3)).strftime("%H:%M")
-                    conn = get_conn()
-                    c = conn.cursor()
-                    c.execute(
-                        """
-                        INSERT INTO pautas_trabalho
-                        (titulo, link_ref, status, data_envio, prioridade, observacao)
-                        VALUES (?,?,'Pendente',?,?,?)
-                        """,
-                        (f_titulo, f_link if f_link else "Sem link", hora_br, f_urgencia, f_obs),
-                    )
+    log(f"🚀 [GM] Monitor iniciado a partir do BO: {proximo_bo}")
+
+    while True:
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            res = requests.get(f"{URL_BASE_GM}{proximo_bo}", headers=headers, timeout=20)
+
+            if res.status_code == 200 and res.content.startswith(b"%PDF"):
+                log(f"🔔 [GM] Ocorrência {proximo_bo} detectada! Enviando...")
+                if enviar_telegram_gm(proximo_bo, res.content):
+                    proximo_bo += 1
+                    salvar_ultimo_id_gm(proximo_bo)
+                    time.sleep(2)
+            else:
+                # Símbolo de atividade no console do Render para acompanhar o bot ativo
+                print(".", end="", flush=True)
+                time.sleep(30)
+
+        except Exception as e:
+            log(f"❌ [GM] Erro no loop: {e}")
+            time.sleep(60)
+
+def loop_monitoramento_bombeiros():
+    # Criação do diretório de banco caso não exista (importante para o Render)
+    dir_db = os.path.dirname(SQLITE_PATH_BM)
+    if dir_db and not os.path.exists(dir_db):
+        os.makedirs(dir_db, exist_ok=True)
+
+    conn = sqlite3.connect(SQLITE_PATH_BM)
+    cursor = conn.cursor()
+    cursor.execute('CREATE TABLE IF NOT EXISTS ocorrencias (id TEXT PRIMARY KEY, datahora TEXT, natureza TEXT, endereco TEXT)')
+    conn.commit()
+
+    log("🚀 [BOMBEIROS] Monitor Toledo News iniciado")
+    
+    cursor.execute('SELECT id FROM ocorrencias')
+    ultima_ids = set(row[0] for row in cursor.fetchall())
+
+    while True:
+        try:
+            dados = coletar_ocorrencias_bombeiros()
+            for o in reversed(dados):
+                if o['id'] not in ultima_ids:
+                    cursor.execute('INSERT OR IGNORE INTO ocorrencias VALUES (?,?,?,?)', (o['id'], o['data'], o['natureza'], o['endereco']))
                     conn.commit()
-                    conn.close()
-                    st.success("✅ Matéria adicionada à fila com sucesso!")
-                    st.rerun()
-                else:
-                    st.warning("Por favor, informe ao menos o título da pauta.")
+                    
+                    data_bruta = o['data'].strip()
+                    if len(data_bruta) >= 14 and data_bruta[10].isdigit():
+                        data_formatada = f"{data_bruta[:10]} às {data_bruta[10:]}"
+                    else:
+                        data_formatada = data_bruta
 
-    with col_monitor:
-        col_m_tit, col_m_ref = st.columns([2, 1])
-        with col_m_tit:
-            st.subheader("👀 Fila de Trabalho")
-        with col_m_ref:
-            if st.button("🔄 Atualizar Fila", key="up_fila_direta", use_container_width=True):
-                st.rerun()
-
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT id, titulo, prioridade, data_envio, status, link_ref, observacao FROM pautas_trabalho WHERE status != 'Concluído' ORDER BY id DESC LIMIT 10")
-        monitor = c.fetchall()
-        conn.close()
-
-        if not monitor:
-            st.info("✨ Tudo em dia! Nenhuma postagem pendente no momento.")
-        else:
-            for p in monitor:
-                p_id, p_titulo, p_prioridade, p_data, p_status, p_link, p_obs = p
-                
-                # Cores de prioridade da borda lateral do card
-                classe_card = "card-pauta"
-                if p_prioridade == "URGENTE":
-                    classe_card = "card-pauta card-urgente"
-                elif p_prioridade == "Programar":
-                    classe_card = "card-pauta card-programar"
-
-                # Define cores do status
-                if p_status == "Postando":
-                    status_cor = "#fd7e14" # Laranja
-                    status_txt = "⚡ POSTANDO AGORA"
-                else:
-                    status_cor = "#004a99" # Azul
-                    status_txt = "⏳ NA FILA"
-
-                with st.container():
-                    st.markdown(
-                        f"""
-                        <div class="{classe_card}">
-                            <div style="display:flex; justify-content:space-between; align-items:center;">
-                                <span style="font-size:0.8rem; color:#666; font-weight:bold;">🕒 {p_data}</span>
-                                <span style="color:{status_cor}; font-weight:bold; font-size:0.85rem;">{status_txt}</span>
-                            </div>
-                            <h4 style="margin: 8px 0; color:#111;">{p_titulo}</h4>
-                            <p style="margin: 4px 0; font-size:0.85rem;"><b>Prioridade:</b> {p_prioridade} | <b>Link:</b> <a href="{p_link}" target="_blank">{p_link}</a></p>
-                            {f'<div class="obs-box"><b>Texto/Obs:</b> {p_obs}</div>' if p_obs else ''}
-                        </div>
-                        """,
-                        unsafe_allow_html=True
+                    relatorio = (
+                        f"*━━━━━━━  OCORRÊNCIA BOMBEIROS  ━━━━━━━*\n\n"
+                        f"*📅 DATA/HORA:* {data_formatada}\n"
+                        f"*🏠 ENDEREÇO:* {o['endereco'].upper().strip()}\n"
+                        f"*🏙️ CIDADE:* TOLEDO\n\n"
+                        f"*📝 DESCRIÇÃO:*\n"
+                        f"_O Corpo de Bombeiros foi acionado para prestar atendimento a uma situação classificada como: {o['natureza'].upper().strip()}. "
+                        f"Equipes de resgate e salvamento operacionais mobilizadas para o endereço informado para controle e suporte da ocorrência._"
                     )
                     
-                    # Botões de Ação rápidos do Card
-                    b_col1, b_col2, b_col3 = st.columns([1, 1, 1])
-                    with b_col1:
-                        if p_status == "Pendente":
-                            if st.button("⚡ Iniciar", key=f"init_{p_id}", use_container_width=True):
-                                conn = get_conn()
-                                c = conn.cursor()
-                                c.execute("UPDATE pautas_trabalho SET status='Postando' WHERE id=?", (p_id,))
-                                conn.commit()
-                                conn.close()
-                                st.rerun()
-                        else:
-                            if st.button("⏳ Pausar", key=f"pause_{p_id}", use_container_width=True):
-                                conn = get_conn()
-                                c = conn.cursor()
-                                c.execute("UPDATE pautas_trabalho SET status='Pendente' WHERE id=?", (p_id,))
-                                conn.commit()
-                                conn.close()
-                                st.rerun()
-                    
-                    with b_col2:
-                        if st.button("✅ Concluir", key=f"done_{p_id}", use_container_width=True, type="primary"):
-                            conn = get_conn()
-                            c = conn.cursor()
-                            c.execute("UPDATE pautas_trabalho SET status='Concluído' WHERE id=?", (p_id,))
-                            conn.commit()
-                            conn.close()
-                            st.toast("Pauta concluída!", icon="✅")
-                            st.rerun()
-                    
-                    with b_col3:
-                        if st.button("❌ Excluir", key=f"del_{p_id}", use_container_width=True):
-                            conn = get_conn()
-                            c = conn.cursor()
-                            c.execute("DELETE FROM pautas_trabalho WHERE id=?", (p_id,))
-                            conn.commit()
-                            conn.close()
-                            st.rerun()
-                    
-                    st.markdown("<div style='margin-bottom:20px;'></div>", unsafe_allow_html=True)
+                    enviar_telegram_bm(relatorio, o['endereco'])
+                    ultima_ids.add(o['id'])
+            
+            time.sleep(INTERVALO_BM)
+        except Exception as e:
+            log(f"❌ [BOMBEIROS] Erro no loop: {e}")
+            time.sleep(60)
+
+# ============================================================
+# 6) EXECUÇÃO PRINCIPAL
+# ============================================================
+if __name__ == "__main__":
+    # Inicia o monitor da Guarda Municipal em segundo plano
+    t_gm = threading.Thread(target=loop_monitoramento_gm)
+    t_gm.daemon = True
+    t_gm.start()
+    
+    # Inicia o monitor do Corpo de Bombeiros em segundo plano
+    t_bm = threading.Thread(target=loop_monitoramento_bombeiros)
+    t_bm.daemon = True
+    t_bm.start()
+    
+    # Executa o servidor Flask do Health Check na porta do Render
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
